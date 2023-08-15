@@ -72,13 +72,7 @@ def send_notification(msg):
             print(e.message)
 
     if PUSH_TOKEN:
-        url = "https://api.pushover.net/1/messages.json"
-        data = {
-            "token": PUSH_TOKEN,
-            "user": PUSH_USER,
-            "message": msg
-        }
-        requests.post(url, data)
+        
 
 
 def get_driver():
