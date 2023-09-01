@@ -1,20 +1,28 @@
 from seleniumwire import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-from time import sleep
+from time import sleep, time
 from configparser import ConfigParser
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait as Wait
 from selenium.webdriver.support import expected_conditions as EC
 from random import randint
 from json import loads
-from requests import post, get
+from requests import post
+from datetime import datetime, timedelta
+
+
+options = webdriver.FirefoxOptions()
+options.binary_location = r'/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox'
+driver = webdriver.Firefox(service=Service('/Users/german.casares/Downloads/geckodriver'), options=options)
+
+# driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
 
 
 REGEX_CONTINUE = "//a[contains(text(),'Continue')]"
-STEP_TIME = 0.5  # time between steps (interactions with forms): 0.5 seconds
-RETRY_TIME = 60*10  # wait time between retries/checks for available dates: 10 minutes
-COOLDOWN_TIME = 60*60  # wait time when temporary banned (empty list): 60 minutes
+STEP_TIME = 0.5                             # time between steps (interactions with forms): 0.5 seconds
+RETRY_TIME = lambda: 60*randint(10,10)      # wait time between retries/checks for available dates: 10 minutes
+COOLDOWN_TIME = 60*60                       # wait time when temporary banned (empty list): 60 minutes
 
 config = ConfigParser()
 config.read('config.ini')
@@ -29,13 +37,11 @@ MY_SCHEDULE_DATE = config['USVISA']['MY_SCHEDULE_DATE']
 PUSH_TOKEN = config['PUSHOVER']['PUSH_TOKEN']
 PUSH_USER = config['PUSHOVER']['PUSH_USER']
 
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
 
 
 def go_to_login():
     print('Start go_to_login')
     navigate_to(f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv")
-    sleep(STEP_TIME)
 
     driver.find_element(By.XPATH, '//a[@class="down-arrow bounce"]').click()
     sleep(STEP_TIME)
@@ -70,14 +76,17 @@ def input_credentials():
 
 
 def is_logged_in():
-    driver.refresh()
     return driver.current_url != 'https://ais.usvisa-info.com/en-ca/niv/users/sign_in'
 
 
 def navigate_to(url):
-    driver.get(url)
-    sleep(STEP_TIME)
+    if driver.current_url != url:
+        driver.get(url)
+        sleep(STEP_TIME * 3)
 
+    # if "HttpReadDisconnect" in driver.page_source:
+    #     driver.refresh()
+    #     navigate_to(url)
     if "502 Bad Gateway" in driver.page_source:
         send_pushover(f"IP Banned, wait for {COOLDOWN_TIME/60} minutes")
         sleep(COOLDOWN_TIME)
@@ -87,12 +96,18 @@ def navigate_to(url):
 def get_earlier_than_scheduled_dates():
     days = next(
         loads(request.response.body) 
-        for request in reversed(driver.requests) 
-        if request.url == 'https://ais.usvisa-info.com/en-ca/niv/schedule/51087110/appointment/days/95.json?appointments[expedite]=false' and request.response != None
+        for request in reversed(driver.requests)
+        if request.url == 'https://ais.usvisa-info.com/en-ca/niv/schedule/51087110/appointment/days/95.json?appointments[expedite]=false'
+        and request.response != None
+        and request.response.status_code == 200
     )
 
     global MY_SCHEDULE_DATE
-    earlier_days = [entry["date"] for entry in days if entry["date"] < MY_SCHEDULE_DATE]
+    earlier_days = [
+        entry["date"] 
+        for entry in days 
+        if entry["date"] < MY_SCHEDULE_DATE
+    ]
 
     return earlier_days
 
@@ -107,11 +122,12 @@ def select_date_in_datepicker(date):
     sleep(STEP_TIME)
 
 
-def get_times_for_current_date():
+def get_times_for_current_date(date):
     return next(
         loads(request.response.body) 
-        for request in reversed(driver.requests) 
+        for request in reversed(driver.requests)
         if request.url == f'https://ais.usvisa-info.com/en-ca/niv/schedule/51087110/appointment/times/95.json?date={date}&appointments[expedite]=false'
+        and request.response.status_code == 200
     )["available_times"]
 
 
@@ -154,25 +170,45 @@ def send_pushover(msg):
     )
 
 
-max_retries = 5
+def sync_to_10_minutes():
+    seconds_to_wait_for = (10*60 - time() % (10*60)) -1
+    print(f"Waiting for {seconds_to_wait_for} seconds, until {datetime.now() + timedelta(0,seconds_to_wait_for)}")
+    sleep(seconds_to_wait_for)
+    print(f"Current time: {datetime.now()}")
+
+max_retries = 20
 
 def main():
     send_pushover("Starting main loop")
+    # driver.refresh()
+    # sleep(5)
     navigate_to(f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment")
-    sleep(STEP_TIME)
-    if not is_logged_in():
+    sleep(5)
+    driver.refresh()
+    if is_logged_in():
+        sync_to_10_minutes()
+        navigate_to(f"https://ais.usvisa-info.com/{COUNTRY_CODE}/niv/schedule/{SCHEDULE_ID}/appointment")
+        # sleep(5)
+    else:
         send_pushover("Logging in")
         go_to_login()
         input_credentials()
         send_pushover("Logged in")
+        sleep(STEP_TIME)
         main()
 
     earlier_than_schedule_dates = get_earlier_than_scheduled_dates()
 
+    dates_message = "Available dates:\n"
+    for date in earlier_than_schedule_dates:
+        dates_message += f"{date}\n"
+
+    send_pushover(dates_message)
+
     for date in earlier_than_schedule_dates:
         select_date_in_datepicker(date)
 
-        times = get_times_for_current_date()
+        times = get_times_for_current_date(date)
 
         for time in times:
             send_pushover(f"Trying to schedule for {date} at {time}")
@@ -188,13 +224,15 @@ def main():
     
     global max_retries
     max_retries = max_retries - 1
-    send_pushover(f"No earlier dates, waiting for {RETRY_TIME/60} minutes. Max retries available: {max_retries}")
-    sleep(RETRY_TIME)
+    retry_time = RETRY_TIME()
+    send_pushover(f"No earlier dates, waiting for {retry_time/60} minutes. Max retries available: {max_retries}")
     if max_retries == 0:
         return
     main()
                 
 
-main()
-
-send_pushover("Program has finished. Update MY_SCHEDULE_DATE and start again")
+try:
+    main()
+    send_pushover("Program has finished. Update MY_SCHEDULE_DATE and start again")
+except Exception as ex:
+    send_pushover(ex)
